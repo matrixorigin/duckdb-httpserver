@@ -580,9 +580,12 @@ namespace duckdb
 
 	static void LoadInternal(ExtensionLoader &loader)
 	{
+		// Capture db instance by value — loader is only valid during Load()
+		auto db = loader.GetDatabaseInstance().shared_from_this();
+
 		auto httpserve_start = ScalarFunction(
 				"httpserve_start", {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR}, LogicalType::VARCHAR,
-				[&](DataChunk &args, ExpressionState &state, Vector &result)
+				[db](DataChunk &args, ExpressionState &state, Vector &result)
 				{
 					auto &host_vector = args.data[0];
 					auto &port_vector = args.data[1];
@@ -592,10 +595,11 @@ namespace duckdb
 																										 {
 			    auto port = ((int32_t *)port_vector.GetData())[0];
 			    auto auth = ((string_t *)auth_vector.GetData())[0];
-			    HttpServerStart(loader.GetDatabaseInstance().shared_from_this(), host, port, auth);
+			    HttpServerStart(db, host, port, auth);
 			    return StringVector::AddString(result, "HTTP server started on " + host.GetString() + ":" +
 			                                               std::to_string(port)); });
 				});
+		httpserve_start.SetVolatile();
 
 		auto httpserve_stop = ScalarFunction("httpserve_stop", {}, LogicalType::VARCHAR,
 																				 [](DataChunk &args, ExpressionState &state, Vector &result)
@@ -603,6 +607,7 @@ namespace duckdb
 																					 HttpServerStop();
 																					 result.SetValue(0, Value("HTTP server stopped"));
 																				 });
+		httpserve_stop.SetVolatile();
 
 		loader.RegisterFunction(httpserve_start);
 		loader.RegisterFunction(httpserve_stop);
@@ -611,6 +616,22 @@ namespace duckdb
 
 		// Register the cleanup function to be called at exit
 		std::atexit(HttpServerCleanup);
+
+		// Auto-start HTTP server from environment variables:
+		//   DUCKDB_HTTPSERVER_HOST (default: 0.0.0.0)
+		//   DUCKDB_HTTPSERVER_PORT (required to auto-start)
+		//   DUCKDB_HTTPSERVER_AUTH (default: empty)
+		const char *port_env = std::getenv("DUCKDB_HTTPSERVER_PORT");
+		if (port_env) {
+			int port = std::atoi(port_env);
+			if (port > 0) {
+				const char *host_env = std::getenv("DUCKDB_HTTPSERVER_HOST");
+				const char *auth_env = std::getenv("DUCKDB_HTTPSERVER_AUTH");
+				std::string host = host_env ? host_env : "0.0.0.0";
+				std::string auth = auth_env ? auth_env : "";
+				HttpServerStart(db, string_t(host), port, string_t(auth));
+			}
+		}
 	}
 
 	void HttpserverExtension::Load(ExtensionLoader &loader)

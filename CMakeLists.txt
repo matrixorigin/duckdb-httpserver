@@ -6,8 +6,9 @@ set(EXTENSION_NAME ${TARGET_NAME}_extension)
 set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
 project(${TARGET_NAME})
+# When built via DuckDB's extension system, CMAKE_SOURCE_DIR is the DuckDB source root.
 include_directories(src/include ${CMAKE_CURRENT_BINARY_DIR}
-                    duckdb/third_party/httplib duckdb/parquet/include)
+                    ${CMAKE_SOURCE_DIR}/third_party/httplib ${CMAKE_SOURCE_DIR}/extension/parquet/include)
 
 # Embed ./src/assets/index.html as a C++ header
 add_custom_command(
@@ -31,6 +32,10 @@ find_package(OpenSSL REQUIRED)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
+
+# httpserver needs C++17 for lambda capture initializers and structured bindings
+set_target_properties(${EXTENSION_NAME} PROPERTIES CXX_STANDARD 17)
+set_target_properties(${LOADABLE_EXTENSION_NAME} PROPERTIES CXX_STANDARD 17)
 
 include_directories(${OPENSSL_INCLUDE_DIR})
 target_link_libraries(${LOADABLE_EXTENSION_NAME} duckdb_mbedtls
