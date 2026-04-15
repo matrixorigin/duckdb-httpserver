@@ -514,44 +514,33 @@ namespace duckdb
 #endif
 
 		const char *run_in_same_thread_env = std::getenv("DUCKDB_HTTPSERVER_FOREGROUND");
-		bool run_in_same_thread = (run_in_same_thread_env != nullptr && std::string(run_in_same_thread_env) == "1");
+		bool foreground_mode = (run_in_same_thread_env != nullptr && std::string(run_in_same_thread_env) == "1");
 
-		if (run_in_same_thread)
+#ifndef _WIN32
+		if (foreground_mode)
 		{
-#ifdef _WIN32
-			throw IOException("Foreground mode not yet supported on WIN32 platforms.");
-#else
-			// POSIX signal handler for SIGINT (Linux/macOS)
+			// POSIX signal handler for graceful shutdown via SIGINT
 			signal(SIGINT, [](int)
 						 {
 							 if (global_state.server)
 							 {
 								 global_state.server->stop();
 							 }
-							 global_state.is_running = false; // Update the running state
+							 global_state.is_running = false;
 						 });
-
-			// Run the server in the same thread
-			if (!global_state.server->listen(host_str.c_str(), port))
-			{
-				global_state.is_running = false;
-				throw IOException("Failed to start HTTP server on " + host_str + ":" + std::to_string(port));
-			}
+		}
 #endif
 
-			// The server has stopped (due to CTRL-C or other reasons)
-			global_state.is_running = false;
-		}
-		else
-		{
-			// Run the server in a dedicated thread (default)
-			global_state.server_thread = make_uniq<std::thread>([host_str, port]()
-																													{
+		// Always run the server in a dedicated thread so that extension
+		// loading can continue to completion.  When FOREGROUND mode is
+		// active the process is kept alive by a blocking atexit handler
+		// registered in LoadInternal instead.
+		global_state.server_thread = make_uniq<std::thread>([host_str, port]()
+																												{
 			if (!global_state.server->listen(host_str.c_str(), port)) {
 				global_state.is_running = false;
 				throw IOException("Failed to start HTTP server on " + host_str + ":" + std::to_string(port));
 			} });
-		}
 	}
 
 	void HttpServerStop()
@@ -631,6 +620,22 @@ namespace duckdb
 				std::string auth = auth_env ? auth_env : "";
 				HttpServerStart(db, string_t(host), port, string_t(auth));
 			}
+		}
+
+		// When FOREGROUND mode is active, register a blocking atexit handler
+		// that keeps the process alive until the HTTP server is stopped (e.g.
+		// via SIGINT).  Registered AFTER HttpServerCleanup so it runs BEFORE
+		// it in the LIFO atexit order.
+		const char *fg_env = std::getenv("DUCKDB_HTTPSERVER_FOREGROUND");
+		if (fg_env && std::string(fg_env) == "1" && global_state.is_running) {
+			std::atexit([]() {
+				while (global_state.is_running) {
+					std::this_thread::sleep_for(std::chrono::milliseconds(100));
+				}
+				if (global_state.server_thread && global_state.server_thread->joinable()) {
+					global_state.server_thread->join();
+				}
+			});
 		}
 	}
 
