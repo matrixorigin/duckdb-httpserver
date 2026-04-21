@@ -15,6 +15,8 @@
 #include "httplib.hpp"
 #include "yyjson.hpp"
 #include "playground.hpp"
+#include "duckdb/planner/extension_callback.hpp"
+#include "duckdb/main/config.hpp"
 
 #ifndef _WIN32
 #include <syslog.h>
@@ -567,6 +569,29 @@ namespace duckdb
 		HttpServerStop();
 	}
 
+	// In FOREGROUND mode, register an atexit blocker the first time a DuckDB
+	// connection is opened.  Registering here (after all extensions have
+	// finished loading) guarantees ours is the most recently added atexit
+	// handler and thus runs FIRST on exit (LIFO), before RMM/cuDF/cudart
+	// atexits added during sirius load — keeping CUDA alive so the HTTP
+	// server can continue serving GPU queries until SIGINT sets is_running
+	// to false.  Without this, detached-mode (stdin EOF → main returns)
+	// tears down CUDA and every GPU query fails with cudaErrorCudartUnloading.
+	class HttpServerForegroundBlocker : public ExtensionCallback {
+	public:
+		void OnConnectionOpened(ClientContext &) final {
+			if (registered_.exchange(true)) return;
+			std::atexit([] {
+				while (global_state.is_running) {
+					std::this_thread::sleep_for(std::chrono::milliseconds(100));
+				}
+			});
+		}
+
+	private:
+		std::atomic<bool> registered_{false};
+	};
+
 	static void LoadInternal(ExtensionLoader &loader)
 	{
 		// Capture db instance by value — loader is only valid during Load()
@@ -622,20 +647,12 @@ namespace duckdb
 			}
 		}
 
-		// When FOREGROUND mode is active, register a blocking atexit handler
-		// that keeps the process alive until the HTTP server is stopped (e.g.
-		// via SIGINT).  Registered AFTER HttpServerCleanup so it runs BEFORE
-		// it in the LIFO atexit order.
+		// FOREGROUND mode: register an ExtensionCallback that installs the
+		// atexit blocker on first connection open.  See HttpServerForegroundBlocker.
 		const char *fg_env = std::getenv("DUCKDB_HTTPSERVER_FOREGROUND");
 		if (fg_env && std::string(fg_env) == "1" && global_state.is_running) {
-			std::atexit([]() {
-				while (global_state.is_running) {
-					std::this_thread::sleep_for(std::chrono::milliseconds(100));
-				}
-				if (global_state.server_thread && global_state.server_thread->joinable()) {
-					global_state.server_thread->join();
-				}
-			});
+			auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
+			config.GetCallbackManager().Register(make_shared_ptr<HttpServerForegroundBlocker>());
 		}
 	}
 
